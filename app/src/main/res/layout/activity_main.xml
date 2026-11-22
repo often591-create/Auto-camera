@@ -179,8 +179,10 @@
             android:orientation="horizontal" />
 
         <HorizontalScrollView
+            android:id="@+id/modeScroll"
             android:layout_width="match_parent"
             android:layout_height="44dp"
+            android:overScrollMode="never"
             android:scrollbars="none">
 
             <LinearLayout
@@ -191,6 +193,13 @@
                 android:orientation="horizontal"
                 android:paddingHorizontal="16dp" />
         </HorizontalScrollView>
+
+        <View
+            android:layout_width="5dp"
+            android:layout_height="5dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginBottom="2dp"
+            android:background="@drawable/bg_round_on" />
 
         <FrameLayout
             android:layout_width="match_parent"

@@ -115,6 +115,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var exposureVal: TextView
     private lateinit var zoomRow: LinearLayout
     private lateinit var modeBar: LinearLayout
+    private lateinit var modeScroll: android.widget.HorizontalScrollView
     private lateinit var thumb: ImageView
     private lateinit var shutter: View
     private lateinit var btnSwitch: TextView
@@ -265,6 +266,8 @@ class MainActivity : AppCompatActivity() {
         exposureVal = findViewById(R.id.exposureVal)
         zoomRow = findViewById(R.id.zoomRow)
         modeBar = findViewById(R.id.modeBar)
+        modeScroll = findViewById(R.id.modeScroll)
+        setupModeWheel()
         thumb = findViewById(R.id.thumb)
         shutter = findViewById(R.id.shutter)
         btnSwitch = findViewById(R.id.btnSwitch)
@@ -605,24 +608,102 @@ class MainActivity : AppCompatActivity() {
     private fun pinnedModes(): List<Mode> =
         prefs.pinnedModes.split(",").mapNotNull { n -> Mode.values().firstOrNull { it.name == n } }
 
+    private fun wheelModes(): List<Mode> {
+        val pinned = pinnedModes().filter { modeAvailable(it) }
+        return if (mode in pinned) pinned else pinned + mode
+    }
+
+    /** 模式转盘：当前模式固定在快门正上方的中间；滑到哪个就直接切换，不用再点一下。 */
     private fun buildModeBar() {
         modeBar.removeAllViews()
-        val pinned = pinnedModes().filter { modeAvailable(it) }
-        val shown = if (mode in pinned) pinned else pinned + mode
-        fun add(label: String, on: Boolean, click: () -> Unit) {
+        val side = max(0, (if (root.width > 0) root.width else resources.displayMetrics.widthPixels) / 2 - dp(40))
+        modeBar.setPadding(side, 0, side, 0)
+        val moreOpen = quickPanel.visibility == View.VISIBLE && quickPanelKind == 1
+        fun add(label: String, on: Boolean, tagValue: Any, click: () -> Unit) {
             val t = TextView(this).apply {
                 text = label
-                textSize = 15f
+                textSize = if (on) 16f else 15f
                 setPadding(dp(14), 0, dp(14), 0)
                 gravity = Gravity.CENTER
-                setTextColor(if (on) Color.rgb(255, 182, 39) else Color.WHITE)
+                setTextColor(if (on) Color.rgb(255, 182, 39) else Color.argb(200, 255, 255, 255))
                 paint.isFakeBoldText = on
+                tag = tagValue
                 setOnClickListener { click() }
             }
             modeBar.addView(t, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
         }
-        for (m in shown) add(m.label, m == mode) { hideQuickPanel(); setMode(m) }
-        add("更多", quickPanel.visibility == View.VISIBLE && quickPanelKind == 1) { toggleMorePanel() }
+        for (m in wheelModes()) add(m.label, m == mode && !moreOpen, m) { selectFromWheel(m) }
+        add("更多", moreOpen, "more") { if (!moreOpen) toggleMorePanel() else hideQuickPanel() }
+        modeBar.post { centerWheelOn(if (moreOpen) "more" else mode, smooth = false) }
+    }
+
+    private fun wheelChild(tagValue: Any): View? {
+        for (i in 0 until modeBar.childCount) if (modeBar.getChildAt(i).tag == tagValue) return modeBar.getChildAt(i)
+        return null
+    }
+
+    private var wheelProgrammatic = false
+
+    private fun centerWheelOn(tagValue: Any, smooth: Boolean) {
+        val v = wheelChild(tagValue) ?: return
+        val x = v.left + v.width / 2 - modeScroll.width / 2
+        wheelProgrammatic = true
+        if (smooth) modeScroll.smoothScrollTo(x, 0) else modeScroll.scrollTo(x, 0)
+        main.postDelayed({ wheelProgrammatic = false }, if (smooth) 400 else 50)
+    }
+
+    private fun selectFromWheel(m: Mode) {
+        if (quickPanel.visibility == View.VISIBLE) quickPanel.visibility = View.GONE
+        if (m == mode) { buildModeBar(); buildTopBar(); return }
+        if (recording != null || counting || intervalRunning) { centerWheelOn(mode, true); return }
+        setMode(m)
+    }
+
+    /** 手指放开、滚动停下后，把最靠近中间的模式选起来。 */
+    private val wheelSettle = Runnable {
+        val center = modeScroll.scrollX + modeScroll.width / 2
+        var best: View? = null
+        var bestD = Int.MAX_VALUE
+        for (i in 0 until modeBar.childCount) {
+            val c = modeBar.getChildAt(i)
+            val d = abs(c.left + c.width / 2 - center)
+            if (d < bestD) { bestD = d; best = c }
+        }
+        val t = best?.tag ?: return@Runnable
+        if (t == "more") {
+            if (!(quickPanel.visibility == View.VISIBLE && quickPanelKind == 1)) toggleMorePanel()
+            else centerWheelOn("more", true)
+        } else if (t is Mode) {
+            selectFromWheel(t)
+            if (t == mode) centerWheelOn(t, true)
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupModeWheel() {
+        modeScroll.setOnScrollChangeListener { _, _, _, _, _ ->
+            if (wheelProgrammatic) return@setOnScrollChangeListener
+            main.removeCallbacks(wheelSettle)
+            main.postDelayed(wheelSettle, 160)
+        }
+        modeScroll.setOnTouchListener { _, ev ->
+            if (ev.action == MotionEvent.ACTION_DOWN) wheelProgrammatic = false
+            if (ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL) {
+                main.removeCallbacks(wheelSettle)
+                main.postDelayed(wheelSettle, 160)
+            }
+            false
+        }
+    }
+
+    /** 在取景画面上左右滑动切换模式。 */
+    private fun stepMode(dir: Int) {
+        val list = wheelModes()
+        val i = list.indexOf(mode)
+        val j = i + dir
+        if (i < 0 || j < 0 || j >= list.size) return
+        hideQuickPanel()
+        selectFromWheel(list[j])
     }
 
     private fun setMode(m: Mode) {
@@ -660,23 +741,32 @@ class MainActivity : AppCompatActivity() {
     /** 摄影常用焦段：点同一颗镜头时依序放大，例如主摄 24→28→35mm（1→1.2→1.5×）。 */
     private val CLASSIC_MM = intArrayOf(14, 16, 20, 24, 28, 35, 50, 70, 85, 100, 135, 200, 300)
 
+    /**
+     * 点同一颗镜头时的放大顺序（参考小米、OPPO 系统相机）：
+     * 主摄 1 → 1.2 → 1.5×；光学长焦 ×1.25（2.5× → 3.1×，60 → 75mm）；最后一颗裁切镜头 ×2（5× → 10×）。
+     */
     private fun computeCycles(stops: List<LensStop>): Map<LensStop, List<Float>> {
         val avail = stops.filter { it.available }.sortedBy { it.z }
-        val mainMm = report?.stops?.firstOrNull { it.type == "main" }?.mm?.takeIf { it > 0 } ?: 24
-        val maxZ = if (boundCameraId == null) defaultZoomMax else 99f
         val out = HashMap<LensStop, List<Float>>()
         for ((i, st) in avail.withIndex()) {
-            val baseMm = st.z * mainMm
-            val nextMm = avail.getOrNull(i + 1)?.let { it.z * mainMm } ?: baseMm * 2.1f
-            val extra = CLASSIC_MM.map { it.toFloat() }
-                .filter { it > baseMm * 1.08f && it < nextMm * 0.95f }
-                .map { (it / mainMm * 10).roundToInt() / 10f }
-                .filter { it <= maxZ + 0.01f && it > st.z }
-                .distinct().take(2)
-            out[st] = listOf(st.z) + extra
+            val next = avail.getOrNull(i + 1)?.z
+            val maxZ = if (st.cameraId == null) defaultZoomMax else 99f
+            val cands = when (st.type) {
+                "main" -> listOf(st.z * 1.2f, st.z * 1.5f)
+                "tele" -> listOf(st.z * 1.25f)
+                "crop" -> if (next == null) listOf(st.z * 2f) else emptyList()
+                else -> emptyList()
+            }.map { (it * 10).roundToInt() / 10f }
+                .filter { it > st.z + 0.05f && (next == null || it < next * 0.97f) && it <= maxZ + 0.01f }
+            out[st] = listOf(st.z) + cands
         }
         return out
     }
+
+    /** 独立相机 ID 的基准倍数（同一颗镜头的裁切按钮共用）。 */
+    private fun camBaseZ(id: String): Float =
+        report?.stops?.firstOrNull { it.cameraId == id && it.type != "crop" }?.z
+            ?: report?.stops?.firstOrNull { it.cameraId == id }?.z ?: 1f
 
     private val hideZoomHint = Runnable { zoomHint.visibility = View.INVISIBLE }
 
@@ -718,7 +808,7 @@ class MainActivity : AppCompatActivity() {
         if (s.cameraId != boundCameraId) {
             if (recording != null) { toast("录像中无法切换这颗镜头"); return }
             boundCameraId = s.cameraId
-            pendingZoom = if (s.cameraId == null) s.z else 1f
+            pendingZoom = if (s.cameraId == null) s.z else s.z / camBaseZ(s.cameraId)
             showZoomHint(s.z)
             bindUseCases()
             return
@@ -727,14 +817,13 @@ class MainActivity : AppCompatActivity() {
         val cycle = zoomCycles[s] ?: listOf(s.z)
         val idx = cycle.indexOfFirst { abs(it - eff) < 0.04f }
         val target = if (idx < 0) cycle[0] else cycle[(idx + 1) % cycle.size]
-        cam.cameraControl.setZoomRatio(if (s.cameraId == null) target else target / s.z)
+        cam.cameraControl.setZoomRatio(if (s.cameraId == null) target else target / camBaseZ(s.cameraId))
         showZoomHint(target)
     }
 
     private fun currentEffectiveZoom(ratio: Float): Float {
         val id = boundCameraId ?: return ratio
-        val s = report?.stops?.firstOrNull { it.cameraId == id } ?: return ratio
-        return s.z * ratio
+        return camBaseZ(id) * ratio
     }
 
     private fun updateZoomUi(ratio: Float) {
@@ -786,6 +875,10 @@ class MainActivity : AppCompatActivity() {
                 if (optionScroll.visibility == View.VISIBLE) { hideOptions(); return true }
                 if (quickPanel.visibility == View.VISIBLE) { hideQuickPanel(); return true }
                 focusAt(e.x, e.y); return true
+            }
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if (abs(vx) > abs(vy) * 1.5f && abs(vx) > 900f) { stepMode(if (vx < 0) 1 else -1); return true }
+                return false
             }
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 val cam = camera ?: return false
@@ -1373,7 +1466,7 @@ class MainActivity : AppCompatActivity() {
             appendLine(r.summary)
             appendLine()
             for (s in r.stops) {
-                val t = when (s.type) { "uw" -> "超广角"; "main" -> "主镜头"; "crop" -> "主镜头裁切"; else -> "长焦" }
+                val t = when (s.type) { "uw" -> "超广角"; "main" -> "主镜头"; "crop" -> if (s.source == "长焦裁切") "长焦无损裁切" else "主镜头裁切"; else -> "长焦" }
                 append("${fmtZ(s.z)}×  ${s.mm}mm  $t")
                 s.aperture?.let { append("  f/" + String.format(Locale.US, "%.2f", it)) }
                 if (s.mp > 0) append("  ${s.mp}MP")

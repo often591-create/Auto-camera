@@ -149,6 +149,16 @@ object LensDetector {
             }
         }
 
+        // 高像素长焦：加一个 2 倍无损裁切（例如 2.5× 长焦 → 5×）
+        val teleHi = stops.filter { it.type == "tele" && it.mp >= 40 && it.available }.maxByOrNull { it.z }
+        if (teleHi != null) {
+            val cz = snap(teleHi.z * 2f)
+            if (stops.none { abs(it.z - cz) / cz < 0.12f }) {
+                val ok = teleHi.cameraId != null || reachable(cz)
+                stops.add(LensStop(cz, teleHi.mm * 2, "crop", teleHi.aperture, 0, "长焦裁切", teleHi.cameraId, ok))
+            }
+        }
+
         var dbAdded = 0
         if (db != null) {
             for (d in db.lenses) {
