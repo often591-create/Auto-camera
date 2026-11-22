@@ -615,6 +615,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 模式转盘：当前模式固定在快门正上方的中间；滑到哪个就直接切换，不用再点一下。 */
     private fun buildModeBar() {
+        if (wheelDragging || wheelPendingMode != null) { wheelNeedsRebuild = true; return }
         modeBar.removeAllViews()
         val side = max(0, (if (root.width > 0) root.width else resources.displayMetrics.widthPixels) / 2 - dp(40))
         modeBar.setPadding(side, 0, side, 0)
@@ -643,13 +644,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     private var wheelProgrammatic = false
+    private var wheelDragging = false
+    private var wheelTag: Any? = null
+    private var wheelNeedsRebuild = false
 
     private fun centerWheelOn(tagValue: Any, smooth: Boolean) {
         val v = wheelChild(tagValue) ?: return
         val x = v.left + v.width / 2 - modeScroll.width / 2
+        wheelTag = tagValue
         wheelProgrammatic = true
         if (smooth) modeScroll.smoothScrollTo(x, 0) else modeScroll.scrollTo(x, 0)
-        main.postDelayed({ wheelProgrammatic = false }, if (smooth) 400 else 50)
+        main.postDelayed({ wheelProgrammatic = false }, if (smooth) 350 else 50)
+    }
+
+    /** 只改文字颜色，不重建转盘，拖动时才不会跳。 */
+    private fun recolorWheel(tagValue: Any?) {
+        for (i in 0 until modeBar.childCount) {
+            val t = modeBar.getChildAt(i) as TextView
+            val on = t.tag == tagValue
+            t.setTextColor(if (on) Color.rgb(255, 182, 39) else Color.argb(200, 255, 255, 255))
+            t.paint.isFakeBoldText = on
+            t.invalidate()
+        }
     }
 
     private fun selectFromWheel(m: Mode) {
@@ -659,38 +675,71 @@ class MainActivity : AppCompatActivity() {
         setMode(m)
     }
 
-    /** 手指放开、滚动停下后，把最靠近中间的模式选起来。 */
-    private val wheelSettle = Runnable {
+    // 文字一碰到中间的小点就切换；相机重新绑定稍微延后，快速滑过多个模式时不会卡。
+    private var wheelPendingMode: Mode? = null
+    private val wheelApply = Runnable {
+        val m = wheelPendingMode ?: return@Runnable
+        wheelPendingMode = null
+        if (m != mode && recording == null && !counting && !intervalRunning) {
+            mode = m
+            sportOn = false; macroOn = false
+            if (m == Mode.PORTRAIT || m == Mode.NIGHT) boundCameraId = null
+            rebind()
+        }
+    }
+
+    private fun onWheelScrolled() {
         val center = modeScroll.scrollX + modeScroll.width / 2
-        var best: View? = null
-        var bestD = Int.MAX_VALUE
         for (i in 0 until modeBar.childCount) {
             val c = modeBar.getChildAt(i)
-            val d = abs(c.left + c.width / 2 - center)
-            if (d < bestD) { bestD = d; best = c }
+            if (center < c.left || center > c.right) continue
+            val t = c.tag ?: return
+            if (t == wheelTag) return
+            if (recording != null || counting || intervalRunning) return
+            wheelTag = t
+            recolorWheel(t)
+            modeScroll.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+            if (t is Mode) {
+                if (quickPanel.visibility == View.VISIBLE) quickPanel.visibility = View.GONE
+                wheelPendingMode = t
+                main.removeCallbacks(wheelApply)
+                main.postDelayed(wheelApply, 120)
+            }
+            return
         }
-        val t = best?.tag ?: return@Runnable
+    }
+
+    /** 手指放开、滚动停下后，把选中的模式对准中间。 */
+    private val wheelSettle = Runnable {
+        wheelDragging = false
+        val t = wheelTag
         if (t == "more") {
             if (!(quickPanel.visibility == View.VISIBLE && quickPanelKind == 1)) toggleMorePanel()
             else centerWheelOn("more", true)
-        } else if (t is Mode) {
-            selectFromWheel(t)
-            if (t == mode) centerWheelOn(t, true)
+            return@Runnable
         }
+        if (wheelNeedsRebuild) { wheelNeedsRebuild = false; buildModeBar() }
+        else centerWheelOn(mode, true)
     }
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupModeWheel() {
         modeScroll.setOnScrollChangeListener { _, _, _, _, _ ->
             if (wheelProgrammatic) return@setOnScrollChangeListener
-            main.removeCallbacks(wheelSettle)
-            main.postDelayed(wheelSettle, 160)
+            onWheelScrolled()
+            if (!wheelDragging) {
+                main.removeCallbacks(wheelSettle)
+                main.postDelayed(wheelSettle, 180)
+            }
         }
         modeScroll.setOnTouchListener { _, ev ->
-            if (ev.action == MotionEvent.ACTION_DOWN) wheelProgrammatic = false
-            if (ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL) {
-                main.removeCallbacks(wheelSettle)
-                main.postDelayed(wheelSettle, 160)
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> { wheelProgrammatic = false; wheelDragging = true; main.removeCallbacks(wheelSettle) }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    wheelDragging = false
+                    main.removeCallbacks(wheelSettle)
+                    main.postDelayed(wheelSettle, 180)
+                }
             }
             false
         }
