@@ -216,7 +216,15 @@ function findByModel(str){
 }
 async function detect(){
   const ua=navigator.userAgent;let found=null,how="",cands=null;
-  // App 版：直接向 Android 系統讀取型號（Build.MODEL）
+  // App 版：直接向手機硬體讀取每顆鏡頭（Camera2 API）
+  try{
+    const P=window.Capacitor&&window.Capacitor.Plugins;
+    if(P&&P.CameraInfo){
+      const hw=await P.CameraInfo.getCameras();
+      if(useHardware(hw))return;
+    }
+  }catch(e){HW_ERR=String(e&&e.message||e);}
+  // App 版備援：只讀型號（Build.MODEL）
   try{
     const Dev=window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.Device;
     if(Dev){const info=await Dev.getInfo();
@@ -246,6 +254,79 @@ async function detect(){
   $("detect").innerHTML=(found&&found.id!=="custom"&&!cands?`<b>✓ 已辨識</b>　`:"")+how;
   setPhone(found.id);
 }
+/* ---------- 硬體鏡頭 → 倍數 ---------- */
+let HW_ERR="",HW_RAW=null;
+const SNAP=[.5,.6,.7,2,2.5,3,3.2,3.5,3.7,4,4.3,5,6,10];
+function hwToLenses(cams){
+  // 後鏡頭、實體鏡頭（有實體鏡頭時排除合併的邏輯鏡頭）
+  const back=cams.filter(c=>c.facing==="back"&&c.sensorW&&c.focalLengths&&c.focalLengths.length);
+  const phys=back.filter(c=>!c.logical);
+  const list=(phys.length?phys:back).map(c=>{
+    const f=c.focalLengths[0],diag=Math.hypot(c.sensorW,c.sensorH);
+    return {id:c.id,f,eq:f*43.27/diag,diag,ap:c.apertures&&c.apertures.length?Math.min(...c.apertures):null,
+      mp:c.pixelW?c.pixelW*c.pixelH/1e6:0,minFocus:c.minFocusDiopter?1/c.minFocusDiopter:null};
+  });
+  // 同一顆鏡頭可能以不同 ID 出現：依等效焦距去重，保留像素較高者
+  const uniq=[];
+  for(const l of list.sort((a,b)=>a.eq-b.eq)){
+    const d=uniq.find(u=>Math.abs(u.eq-l.eq)/u.eq<.06);
+    if(!d)uniq.push(l);else if(l.mp>d.mp)Object.assign(d,l);
+  }
+  if(!uniq.length)return null;
+  // 主鏡頭：等效 20–32mm 中感光元件最大的；沒有就取最接近 25mm
+  const mainC=uniq.filter(u=>u.eq>=20&&u.eq<=32).sort((a,b)=>b.diag-a.diag)[0]||uniq.slice().sort((a,b)=>Math.abs(a.eq-25)-Math.abs(b.eq-25))[0];
+  const lenses=uniq.map(u=>{
+    let z=u.eq/mainC.eq;const s=SNAP.find(v=>Math.abs(v-z)/v<.07);z=u===mainC?1:s||Math.round(z*10)/10;
+    const t=u===mainC?"main":z<.9?"uw":"tele";
+    return {z,mm:Math.round(u.eq),t,f:u.ap?+u.ap.toFixed(2):(t==="main"?1.8:2.4),
+      note:(u.mp?Math.round(u.mp)+"MP":"")+(t==="main"&&u.diag>14?" 大底":""),hw:true,minFocus:u.minFocus};
+  });
+  // 主鏡頭高像素：加上 2× 裁切（沒有 1.6–2.4× 的實體鏡頭時）
+  if(mainC.mp>=40&&!lenses.some(l=>l.z>=1.6&&l.z<=2.4))lenses.push({z:2,mm:Math.round(mainC.eq*2),t:"crop",f:lenses.find(l=>l.t==="main").f,hw:true});
+  return lenses.sort((a,b)=>a.z-b.z);
+}
+function useHardware(hw){
+  HW_RAW=hw;
+  const lenses=hwToLenses(hw.cameras||[]);
+  const db=findByModel(hw.model)||findByModel((hw.manufacturer||"")+" "+hw.model);
+  const name=`${hw.manufacturer||""} ${hw.model||""}`.trim();
+  if(!lenses){
+    if(db){$("detect").innerHTML=`<b>✓ 已辨識</b>　${name}（系統沒有提供鏡頭參數，改用資料庫的 ${db.name}）`;setPhone(db.id);return true;}
+    return false;
+  }
+  const hwOptical=lenses.filter(l=>l.t!=="crop").length;
+  const dbOptical=db?db.lenses.filter(l=>l.t!=="crop").length:0;
+  const zMin=Math.min(...(hw.cameras||[]).filter(c=>c.facing==="back"&&c.zoomMin).map(c=>c.zoomMin),9);
+  // 廠商把部分鏡頭藏起來 → 用資料庫補
+  if(db&&dbOptical>hwOptical){
+    const hidden=db.lenses.filter(dl=>dl.t!=="crop"&&!lenses.some(l=>Math.abs(l.z-dl.z)/dl.z<.12));
+    const merged=lenses.concat(hidden.map(h=>Object.assign({},h,{note:"資料庫"}))).sort((a,b)=>a.z-b.z);
+    registerHw(merged,db.macro,`本機鏡頭（${name}）`);
+    $("detect").innerHTML=`<b>✓ 已從硬體讀取</b>　${name}：系統開放了 ${hwOptical} 顆鏡頭；${hidden.map(h=>fmtZ(h.z)+"×").join("、")} 被廠商隱藏，已用「${db.name}」的資料補上（標示「資料庫」）。`;
+  }else{
+    // 沒有資料庫可補，但系統變焦下限 < 1，代表有隱藏的超廣角
+    if(!lenses.some(l=>l.t==="uw")&&zMin<.95){lenses.unshift({z:Math.round(zMin*10)/10,mm:Math.round(lenses.find(l=>l.t==="main").mm*zMin),t:"uw",f:2.2,note:"依變焦範圍推算"});}
+    registerHw(lenses,db?db.macro:(lenses.some(l=>l.t==="uw")?"uw":null),`本機鏡頭（${name}）`);
+    $("detect").innerHTML=`<b>✓ 已從硬體讀取</b>　${name}：偵測到 ${hwOptical} 顆後鏡頭${db?"，與資料庫「"+db.name+"」相符":""}。`;
+  }
+  $("detect").innerHTML+=` <a href="#" id="hwMore" style="color:var(--mute)">看原始資料</a>`;
+  $("hwMore").onclick=e=>{e.preventDefault();showRaw();};
+  setPhone("hw");
+  return true;
+}
+function registerHw(lenses,macro,name){
+  let p=PHONES.find(x=>x.id==="hw");
+  if(!p){p={id:"hw",m:[]};PHONES.unshift(p);}
+  Object.assign(p,{name,lenses,macro});
+  $("phone").innerHTML=PHONES.map(p=>`<option value="${p.id}">${p.name}</option>`).join("");
+}
+function showRaw(){
+  const back=(HW_RAW.cameras||[]).filter(c=>c.facing==="back");
+  const rows=back.map(c=>{const f=c.focalLengths&&c.focalLengths[0];const eq=f&&c.sensorW?Math.round(f*43.27/Math.hypot(c.sensorW,c.sensorH)):"?";
+    return `ID ${c.id}${c.parent?"（屬於 "+c.parent+"）":""}${c.logical?" 邏輯鏡頭":""}${c.probed?" 隱藏":""}：f=${f?f.toFixed(2):"?"}mm → 等效 ${eq}mm，感光元件 ${c.sensorW?c.sensorW.toFixed(1)+"×"+c.sensorH.toFixed(1)+"mm":"?"}，${c.pixelW?Math.round(c.pixelW*c.pixelH/1e6)+"MP":""}${c.apertures&&c.apertures.length?"，f/"+c.apertures.join("/"):""}${c.zoomMin?"，變焦 "+c.zoomMin.toFixed(2)+"–"+c.zoomMax.toFixed(0)+"×":""}`;});
+  $("detect").innerHTML+=`<div style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:var(--mute)">${rows.map(esc).join("<br>")||"系統沒有回報任何後鏡頭"}</div>`;
+}
+
 function setPhone(id){
   S.phone=PHONES.find(p=>p.id===id);$("phone").value=id;store.set("lensPhone",id);
   $("customBox").style.display=id==="custom"?"block":"none";
@@ -257,7 +338,7 @@ function lensesOf(){
   return zs.map(z=>z<1?L(z,26*z,"uw",2.2):z===1?L(1,26,"main",1.7):L(z,26*z,z===2&&!zs.includes(3)&&zs.length<=3?"crop":"tele",2.6));
 }
 function renderLenses(){
-  $("lenses").innerHTML=lensesOf().map(l=>`<span class="lens ${l.t==="crop"?"crop":""}">${fmtZ(l.z)}×<small>${l.mm}mm${l.t==="crop"?" 裁切":l.t==="uw"?" 超廣":l.t==="tele"?" 長焦":" 主鏡"}</small></span>`).join("");
+  $("lenses").innerHTML=lensesOf().map(l=>`<span class="lens ${l.t==="crop"?"crop":""}">${fmtZ(l.z)}×<small>${l.mm}mm${l.t==="crop"?" 裁切":l.t==="uw"?" 超廣":l.t==="tele"?" 長焦":" 主鏡"}${l.note==="資料庫"||l.note==="依變焦範圍推算"?" ·"+l.note:""}</small></span>`).join("");
 }
 
 /* ---------------- 照片分析 ---------------- */

@@ -31,6 +31,7 @@ jobs:
           npm run vendor
           npx cap add android
           npx cap sync android
+          cp native/*.java android/app/src/main/java/com/autocamera/app/
 
       - name: Build debug APK
         working-directory: android
