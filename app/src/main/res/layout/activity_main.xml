@@ -148,6 +148,29 @@
         </LinearLayout>
 
         <LinearLayout
+            android:id="@+id/quickPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginHorizontal="12dp"
+            android:layout_marginBottom="8dp"
+            android:background="@drawable/bg_panel"
+            android:orientation="vertical"
+            android:padding="12dp"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/zoomHint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:background="@drawable/bg_pill"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="2dp"
+            android:textColor="#FFB627"
+            android:textSize="12sp"
+            android:visibility="invisible" />
+
+        <LinearLayout
             android:id="@+id/zoomRow"
             android:layout_width="wrap_content"
             android:layout_height="52dp"

@@ -86,7 +86,14 @@ import kotlin.math.roundToInt
 @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 class MainActivity : AppCompatActivity() {
 
-    enum class Mode(val label: String) { PHOTO("拍照"), PORTRAIT("人像"), NIGHT("夜景"), VIDEO("录像"), PRO("专业") }
+    enum class Mode(val label: String, val icon: String) {
+        PHOTO("拍照", "拍"), PORTRAIT("人像", "人"), VIDEO("录像", "录"), PRO("专业", "PRO"),
+        NIGHT("夜景", "夜"), HIRES("高像素", "HD"), WIDE("宽幅", "宽"), PRO_VIDEO("专业录像", "PRO")
+    }
+
+    private fun isVideo(m: Mode = mode) = m == Mode.VIDEO || m == Mode.PRO_VIDEO
+    private fun isPro(m: Mode = mode) = m == Mode.PRO || m == Mode.PRO_VIDEO
+    private fun isPhotoLike(m: Mode = mode) = m == Mode.PHOTO || m == Mode.PRO || m == Mode.HIRES || m == Mode.WIDE
 
     private lateinit var prefs: Prefs
     private lateinit var root: FrameLayout
@@ -97,6 +104,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var topBar: LinearLayout
     private lateinit var optionScroll: View
     private lateinit var optionStrip: LinearLayout
+    private lateinit var quickPanel: LinearLayout
+    private lateinit var zoomHint: TextView
     private lateinit var recTime: TextView
     private lateinit var countdown: TextView
     private lateinit var proInfo: TextView
@@ -134,6 +143,13 @@ class MainActivity : AppCompatActivity() {
     private var defaultZoomMin = 1f
     private var defaultZoomMax = 1f
     private var torchOn = false
+    private var sportOn = false
+    private var macroOn = false
+    private var intervalSec = 0
+    private var intervalRunning = false
+    private var intervalShots = 0
+    private var hdrExtAvailable = false
+    private var zoomCycles: Map<LensStop, List<Float>> = emptyMap()
 
     // 这支手机实际支持的录像／拍照规格（每次绑定前从相机读取）
     private var videoQualityList: List<Quality> = listOf(Quality.FHD)
@@ -213,6 +229,7 @@ class MainActivity : AppCompatActivity() {
         recording?.stop()
         recording = null
         bursting = false
+        stopInterval()
     }
 
     override fun onDestroy() {
@@ -237,6 +254,8 @@ class MainActivity : AppCompatActivity() {
         topBar = findViewById(R.id.topBar)
         optionScroll = findViewById(R.id.optionScroll)
         optionStrip = findViewById(R.id.optionStrip)
+        quickPanel = findViewById(R.id.quickPanel)
+        zoomHint = findViewById(R.id.zoomHint)
         recTime = findViewById(R.id.recTime)
         countdown = findViewById(R.id.countdown)
         proInfo = findViewById(R.id.proInfo)
@@ -297,11 +316,14 @@ class MainActivity : AppCompatActivity() {
     private fun extensionFor(m: Mode) = when (m) {
         Mode.PORTRAIT -> ExtensionMode.BOKEH
         Mode.NIGHT -> ExtensionMode.NIGHT
+        Mode.PHOTO -> if (prefs.autoHdr && hdrExtAvailable && !sportOn && !macroOn) ExtensionMode.HDR else null
         else -> null
     }
 
     private fun modeAvailable(m: Mode): Boolean {
-        val ext = extensionFor(m) ?: return true
+        if (m == Mode.HIRES) return facing == CameraSelector.LENS_FACING_BACK && photoMaxMp > photoStdMp + 1
+        if (m == Mode.PRO_VIDEO || m == Mode.WIDE) return true
+        val ext = when (m) { Mode.PORTRAIT -> ExtensionMode.BOKEH; Mode.NIGHT -> ExtensionMode.NIGHT; else -> return true }
         val em = extensions ?: return false
         val sel = CameraSelector.Builder().requireLensFacing(facing).build()
         return try { em.isExtensionAvailable(sel, ext) } catch (e: Exception) { false }
@@ -312,8 +334,9 @@ class MainActivity : AppCompatActivity() {
         val w = root.width
         if (w == 0) { root.post { rebind() }; return }
         val lp = frame.layoutParams as FrameLayout.LayoutParams
-        when (if (mode == Mode.VIDEO) 1 else prefs.ratio) {
+        when (if (isVideo()) 1 else if (mode == Mode.HIRES) 0 else if (mode == Mode.WIDE) 9 else prefs.ratio) {
             0 -> { lp.width = w; lp.height = w * 4 / 3 }
+            9 -> { lp.width = w; lp.height = w * 24 / 65 }
             1 -> { lp.width = w; lp.height = w * 16 / 9 }
             2 -> { lp.width = w; lp.height = w }
             else -> { lp.width = FrameLayout.LayoutParams.MATCH_PARENT; lp.height = FrameLayout.LayoutParams.MATCH_PARENT }
@@ -332,15 +355,18 @@ class MainActivity : AppCompatActivity() {
         val ext = extensionFor(mode)
         if (ext != null) {
             val em = extensions
-            if (em != null && modeAvailable(mode)) {
+            val ok = em != null && try { em.isExtensionAvailable(CameraSelector.Builder().requireLensFacing(facing).build(), ext) } catch (e: Exception) { false }
+            if (em != null && ok) {
+                boundCameraId = null
                 selector = em.getExtensionEnabledCameraSelector(CameraSelector.Builder().requireLensFacing(facing).build(), ext)
-            } else {
+            } else if (mode != Mode.PHOTO) {
                 toast("这支手机没有开放「${mode.label}」模式给第三方 App")
                 mode = Mode.PHOTO; buildModeBar()
             }
         }
 
-        val aspect = if (mode == Mode.VIDEO || prefs.ratio == 1 || prefs.ratio == 3) androidx.camera.core.AspectRatio.RATIO_16_9 else androidx.camera.core.AspectRatio.RATIO_4_3
+        val ratioNow = if (mode == Mode.HIRES || mode == Mode.WIDE) 0 else prefs.ratio
+        val aspect = if (isVideo() || ratioNow == 1 || ratioNow == 3) androidx.camera.core.AspectRatio.RATIO_16_9 else androidx.camera.core.AspectRatio.RATIO_4_3
         val aspectStrategy = AspectRatioStrategy(aspect, AspectRatioStrategy.FALLBACK_RULE_AUTO)
 
         val previewBuilder = Preview.Builder()
@@ -361,7 +387,7 @@ class MainActivity : AppCompatActivity() {
         val group = UseCaseGroup.Builder().addUseCase(preview)
         if (viewPort != null) group.setViewPort(viewPort)
 
-        if (mode == Mode.VIDEO) {
+        if (isVideo()) {
             val q = currentQuality()
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
@@ -376,7 +402,7 @@ class MainActivity : AppCompatActivity() {
             group.addUseCase(vc)
         } else {
             val resBuilder = ResolutionSelector.Builder().setAspectRatioStrategy(aspectStrategy)
-            if (prefs.maxResolution && photoMaxMp > photoStdMp) {
+            if ((prefs.maxResolution || mode == Mode.HIRES) && photoMaxMp > photoStdMp) {
                 resBuilder.setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
                 if (ext == null) resBuilder.setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
             } else {
@@ -395,7 +421,7 @@ class MainActivity : AppCompatActivity() {
         try {
             camera = p.bindToLifecycle(this, selector, group.build())
         } catch (e: Exception) {
-            if (mode == Mode.VIDEO) {
+            if (isVideo()) {
                 when {
                     prefs.videoHdr && hdrSupported -> { prefs.videoHdr = false; toast("目前的规格不支持 HDR，已关闭 HDR"); bindUseCases(); return }
                     currentFps() > 30 -> { prefs.videoFps = 30; toast("目前的分辨率不支持这个帧率，已改为 30fps"); bindUseCases(); return }
@@ -403,7 +429,7 @@ class MainActivity : AppCompatActivity() {
                     prefs.videoStab && stabSupported -> { prefs.videoStab = false; toast("已关闭防抖"); bindUseCases(); return }
                 }
             }
-            if (mode != Mode.VIDEO && prefs.maxResolution) {
+            if (!isVideo() && prefs.maxResolution && mode != Mode.HIRES) {
                 prefs.maxResolution = false; toast("无法使用最高像素，已改为标准像素"); bindUseCases(); return
             }
             if (boundCameraId != null) {
@@ -426,8 +452,13 @@ class MainActivity : AppCompatActivity() {
             cam.cameraControl.setZoomRatio(pendingZoom)
             pendingZoom = 1f
         }
-        if (mode == Mode.VIDEO) cam.cameraControl.enableTorch(torchOn) else applyFlash()
+        if (isVideo()) cam.cameraControl.enableTorch(torchOn) else applyFlash()
+        try {
+            hdrExtAvailable = extensions?.isExtensionAvailable(CameraSelector.Builder().requireLensFacing(facing).build(), ExtensionMode.HDR) == true
+        } catch (_: Exception) { hdrExtAvailable = false }
         buildTopBar()
+        if (quickPanel.visibility == View.VISIBLE && quickPanelKind == 0) buildQuickPanel()
+        buildModeBar()
         buildZoomRow()
         setupExposure()
         buildProPanel()
@@ -490,7 +521,7 @@ class MainActivity : AppCompatActivity() {
         topBar.removeAllViews()
         val items = mutableListOf<TopItem>()
         val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
-        if (mode == Mode.VIDEO) {
+        if (isVideo()) {
             if (hasFlash) items.add(TopItem(if (torchOn) "补光 开" else "补光 关", torchOn) {
                 torchOn = !torchOn; camera?.cameraControl?.enableTorch(torchOn); buildTopBar()
             })
@@ -511,15 +542,13 @@ class MainActivity : AppCompatActivity() {
             if (hasFlash) items.add(TopItem(arrayOf("自动闪光", "闪光 开", "闪光 关", "常亮")[flash], flash != 2) {
                 flash = (flash + 1) % 4; applyFlash(); buildTopBar()
             })
-            items.add(TopItem(if (timerSec == 0) "定时 关" else "定时 ${timerSec}s", timerSec != 0) {
-                timerSec = when (timerSec) { 0 -> 3; 3 -> 10; else -> 0 }; buildTopBar()
-            })
-            val ratios = listOf("4:3", "16:9", "1:1", "全屏")
-            items.add(TopItem(ratios[prefs.ratio], false) {
-                showOptions(ratios, prefs.ratio) { i -> prefs.ratio = i; rebind() }
-            })
+            if (extensionFor(mode) == ExtensionMode.HDR) items.add(TopItem("HDR", true) { prefs.autoHdr = false; rebind() })
+            if (sportOn) items.add(TopItem("运动", true) { sportOn = false; applyPro(); buildTopBar() })
+            if (macroOn) items.add(TopItem("微距", true) { macroOn = false; applyPro(); buildTopBar() })
+            if (timerSec > 0) items.add(TopItem("${timerSec}s", true) { timerSec = 0; buildTopBar() })
+            if (intervalSec > 0) items.add(TopItem("间隔${intervalSec}s", true) { intervalSec = 0; stopInterval(); buildTopBar() })
             val actual = imageCapture?.resolutionInfo?.resolution?.let { (it.width.toLong() * it.height / 1_000_000L).toInt() }
-            if (photoMaxMp > photoStdMp + 1) {
+            if (photoMaxMp > photoStdMp + 1 && mode != Mode.HIRES && mode != Mode.WIDE && extensionFor(mode) == null) {
                 val label = "${actual ?: if (prefs.maxResolution) photoMaxMp else photoStdMp}M"
                 items.add(TopItem(label, prefs.maxResolution) {
                     showOptions(listOf("标准 ${photoStdMp}M", "最高 ${photoMaxMp}M"), if (prefs.maxResolution) 1 else 0) { i ->
@@ -528,8 +557,7 @@ class MainActivity : AppCompatActivity() {
                 })
             }
         }
-        items.add(TopItem("网格", prefs.grid) { prefs.grid = !prefs.grid; overlay.grid = prefs.grid; buildTopBar() })
-        items.add(TopItem("设置", false) { showSettings() })
+        items.add(TopItem("⋮⋮", quickPanel.visibility == View.VISIBLE && quickPanelKind == 0) { toggleQuickPanel() })
         for (it in items) {
             topBar.addView(TextView(this).apply {
                 text = it.label
@@ -574,26 +602,33 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------------------------------------------------------- 模式
 
+    private fun pinnedModes(): List<Mode> =
+        prefs.pinnedModes.split(",").mapNotNull { n -> Mode.values().firstOrNull { it.name == n } }
+
     private fun buildModeBar() {
         modeBar.removeAllViews()
-        for (m in Mode.values()) {
-            if (!modeAvailable(m)) continue
+        val pinned = pinnedModes().filter { modeAvailable(it) }
+        val shown = if (mode in pinned) pinned else pinned + mode
+        fun add(label: String, on: Boolean, click: () -> Unit) {
             val t = TextView(this).apply {
-                text = m.label
+                text = label
                 textSize = 15f
                 setPadding(dp(14), 0, dp(14), 0)
                 gravity = Gravity.CENTER
-                setTextColor(if (m == mode) Color.rgb(255, 182, 39) else Color.WHITE)
-                paint.isFakeBoldText = m == mode
-                setOnClickListener { setMode(m) }
+                setTextColor(if (on) Color.rgb(255, 182, 39) else Color.WHITE)
+                paint.isFakeBoldText = on
+                setOnClickListener { click() }
             }
             modeBar.addView(t, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
         }
+        for (m in shown) add(m.label, m == mode) { hideQuickPanel(); setMode(m) }
+        add("更多", quickPanel.visibility == View.VISIBLE && quickPanelKind == 1) { toggleMorePanel() }
     }
 
     private fun setMode(m: Mode) {
-        if (m == mode || recording != null || counting) return
+        if (m == mode || recording != null || counting || intervalRunning) return
         mode = m
+        sportOn = false; macroOn = false
         if (m == Mode.PORTRAIT || m == Mode.NIGHT) boundCameraId = null
         buildModeBar()
         rebind()
@@ -622,8 +657,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 摄影常用焦段：点同一颗镜头时依序放大，例如主摄 24→28→35mm（1→1.2→1.5×）。 */
+    private val CLASSIC_MM = intArrayOf(14, 16, 20, 24, 28, 35, 50, 70, 85, 100, 135, 200, 300)
+
+    private fun computeCycles(stops: List<LensStop>): Map<LensStop, List<Float>> {
+        val avail = stops.filter { it.available }.sortedBy { it.z }
+        val mainMm = report?.stops?.firstOrNull { it.type == "main" }?.mm?.takeIf { it > 0 } ?: 24
+        val maxZ = if (boundCameraId == null) defaultZoomMax else 99f
+        val out = HashMap<LensStop, List<Float>>()
+        for ((i, st) in avail.withIndex()) {
+            val baseMm = st.z * mainMm
+            val nextMm = avail.getOrNull(i + 1)?.let { it.z * mainMm } ?: baseMm * 2.1f
+            val extra = CLASSIC_MM.map { it.toFloat() }
+                .filter { it > baseMm * 1.08f && it < nextMm * 0.95f }
+                .map { (it / mainMm * 10).roundToInt() / 10f }
+                .filter { it <= maxZ + 0.01f && it > st.z }
+                .distinct().take(2)
+            out[st] = listOf(st.z) + extra
+        }
+        return out
+    }
+
+    private val hideZoomHint = Runnable { zoomHint.visibility = View.INVISIBLE }
+
+    private fun showZoomHint(z: Float) {
+        val mainMm = report?.stops?.firstOrNull { it.type == "main" }?.mm?.takeIf { it > 0 } ?: 24
+        zoomHint.text = "${(z * mainMm).roundToInt()}mm"
+        zoomHint.visibility = View.VISIBLE
+        main.removeCallbacks(hideZoomHint)
+        main.postDelayed(hideZoomHint, 1500)
+    }
+
     private fun buildZoomRow() {
         zoomRow.removeAllViews()
+        zoomCycles = computeCycles(zoomStops())
         for (s in zoomStops()) {
             val t = TextView(this).apply {
                 text = fmtZ(s.z)
@@ -652,11 +719,16 @@ class MainActivity : AppCompatActivity() {
             if (recording != null) { toast("录像中无法切换这颗镜头"); return }
             boundCameraId = s.cameraId
             pendingZoom = if (s.cameraId == null) s.z else 1f
+            showZoomHint(s.z)
             bindUseCases()
             return
         }
-        if (s.cameraId == null) cam.cameraControl.setZoomRatio(s.z)
-        else cam.cameraControl.setZoomRatio(1f)
+        val eff = currentEffectiveZoom(cam.cameraInfo.zoomState.value?.zoomRatio ?: 1f)
+        val cycle = zoomCycles[s] ?: listOf(s.z)
+        val idx = cycle.indexOfFirst { abs(it - eff) < 0.04f }
+        val target = if (idx < 0) cycle[0] else cycle[(idx + 1) % cycle.size]
+        cam.cameraControl.setZoomRatio(if (s.cameraId == null) target else target / s.z)
+        showZoomHint(target)
     }
 
     private fun currentEffectiveZoom(ratio: Float): Float {
@@ -712,6 +784,7 @@ class MainActivity : AppCompatActivity() {
         val tap = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 if (optionScroll.visibility == View.VISIBLE) { hideOptions(); return true }
+                if (quickPanel.visibility == View.VISIBLE) { hideQuickPanel(); return true }
                 focusAt(e.x, e.y); return true
             }
             override fun onDoubleTap(e: MotionEvent): Boolean {
@@ -742,7 +815,7 @@ class MainActivity : AppCompatActivity() {
             val ok = try { f.get().isFocusSuccessful } catch (e: Exception) { false }
             overlay.focusResult(ok)
         }, ContextCompat.getMainExecutor(this))
-        if (cam.cameraInfo.exposureState.isExposureCompensationSupported && mode != Mode.PRO) {
+        if (cam.cameraInfo.exposureState.isExposureCompensationSupported && !isPro()) {
             exposureRow.visibility = View.VISIBLE
             main.removeCallbacks(hideExposure)
             main.postDelayed(hideExposure, 5000)
@@ -788,7 +861,7 @@ class MainActivity : AppCompatActivity() {
 
     private val proTicker = object : Runnable {
         override fun run() {
-            if (mode != Mode.PRO) return
+            if (!isPro()) return
             val iso = liveIso; val ex = liveExposure; val fd = liveFocus
             proInfo.text = buildString {
                 append("ISO ${iso ?: "-"}")
@@ -802,7 +875,7 @@ class MainActivity : AppCompatActivity() {
     private fun buildProPanel() {
         proPanel.removeAllViews()
         main.removeCallbacks(proTicker)
-        if (mode != Mode.PRO) { proPanel.visibility = View.GONE; proInfo.visibility = View.GONE; return }
+        if (!isPro()) { proPanel.visibility = View.GONE; proInfo.visibility = View.GONE; return }
         proPanel.visibility = View.VISIBLE
         proInfo.visibility = View.VISIBLE
         main.post(proTicker)
@@ -865,7 +938,25 @@ class MainActivity : AppCompatActivity() {
     private fun applyPro() {
         val cam = camera ?: return
         val b = CaptureRequestOptions.Builder()
-        if (mode == Mode.PRO) {
+        val c2 = Camera2CameraInfo.from(cam.cameraInfo)
+        if (!isPro() && extensionFor(mode) == null) {
+            if (sportOn) {
+                val scenes = c2.getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES) ?: IntArray(0)
+                if (scenes.contains(CaptureRequest.CONTROL_SCENE_MODE_ACTION)) {
+                    b.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+                    b.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_ACTION)
+                } else {
+                    val fr = c2.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                        ?.filter { it.lower == it.upper }?.maxByOrNull { it.upper }
+                    if (fr != null) b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fr)
+                }
+            }
+            if (macroOn) {
+                val afs = c2.getCameraCharacteristic(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
+                if (afs.contains(CaptureRequest.CONTROL_AF_MODE_MACRO)) b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_MACRO)
+            }
+        }
+        if (isPro()) {
             if (proIso != null || proExposure != null) {
                 b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                 b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, proIso ?: liveIso ?: 100)
@@ -880,13 +971,184 @@ class MainActivity : AppCompatActivity() {
         try { Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(b.build()) } catch (_: Exception) { }
     }
 
+    // ---------------------------------------------------------------- 快捷面板（⋮⋮）与「更多」模式
+
+    private var quickPanelKind = 0  // 0 快捷设定 1 更多模式
+
+    private class QItem(val icon: String, val label: String, val active: Boolean, val onClick: () -> Unit)
+
+    private fun toggleQuickPanel() {
+        if (quickPanel.visibility == View.VISIBLE && quickPanelKind == 0) { hideQuickPanel(); return }
+        quickPanelKind = 0; buildQuickPanel(); quickPanel.visibility = View.VISIBLE; buildTopBar(); buildModeBar()
+    }
+
+    private fun toggleMorePanel() {
+        if (quickPanel.visibility == View.VISIBLE && quickPanelKind == 1) { hideQuickPanel(); return }
+        quickPanelKind = 1; buildMorePanel(); quickPanel.visibility = View.VISIBLE; buildTopBar(); buildModeBar()
+    }
+
+    private fun hideQuickPanel() {
+        if (quickPanel.visibility != View.VISIBLE) return
+        quickPanel.visibility = View.GONE
+        buildTopBar(); buildModeBar()
+    }
+
+    private fun fillGrid(items: List<QItem>, header: Pair<String, () -> Unit>? = null) {
+        quickPanel.removeAllViews()
+        if (header != null) {
+            quickPanel.addView(TextView(this).apply {
+                text = header.first; textSize = 13f; gravity = Gravity.END
+                setTextColor(Color.rgb(255, 182, 39)); setPadding(0, 0, dp(8), dp(6))
+                setOnClickListener { header.second() }
+            })
+        }
+        var row: LinearLayout? = null
+        items.forEachIndexed { i, it ->
+            if (i % 4 == 0) {
+                row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                quickPanel.addView(row)
+            }
+            val cell = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(0, dp(6), 0, dp(6))
+                setOnClickListener { _ -> it.onClick() }
+            }
+            cell.addView(TextView(this).apply {
+                text = it.icon; textSize = if (it.icon.length > 2) 12f else 15f; gravity = Gravity.CENTER
+                setBackgroundResource(if (it.active) R.drawable.bg_round_on else R.drawable.bg_round_light)
+                setTextColor(if (it.active) Color.rgb(26, 20, 4) else Color.WHITE)
+            }, LinearLayout.LayoutParams(dp(54), dp(54)))
+            cell.addView(TextView(this).apply {
+                text = it.label; textSize = 12f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
+                setPadding(0, dp(6), 0, 0)
+            })
+            row!!.addView(cell, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        val rem = items.size % 4
+        if (rem != 0) repeat(4 - rem) { row!!.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f)) }
+    }
+
+    private fun buildQuickPanel() {
+        val items = mutableListOf<QItem>()
+        if (isVideo()) {
+            if (hdrSupported) items.add(QItem("HDR", "HDR 视频", prefs.videoHdr) { prefs.videoHdr = !prefs.videoHdr; rebind() })
+            if (stabSupported) items.add(QItem("防抖", "防抖", prefs.videoStab) { prefs.videoStab = !prefs.videoStab; rebind() })
+        } else {
+            if (mode == Mode.PHOTO || mode == Mode.PRO) {
+                val ratios = listOf("4:3", "16:9", "1:1", "全屏")
+                items.add(QItem(ratios[prefs.ratio], "画面比例", false) { prefs.ratio = (prefs.ratio + 1) % 4; rebind() })
+            }
+            if (mode == Mode.PHOTO) {
+                items.add(QItem("运动", "运动模式", sportOn) {
+                    sportOn = !sportOn; if (sportOn) macroOn = false
+                    if (extensionFor(Mode.PHOTO) == null && prefs.autoHdr && hdrExtAvailable) rebind() else { applyPro(); buildTopBar(); buildQuickPanel() }
+                    if (sportOn) toast("运动模式：优先使用较快的快门，适合拍动态主体")
+                })
+            }
+            if (mode == Mode.PHOTO || mode == Mode.PRO) {
+                items.add(QItem("微距", "微距特写", macroOn) { toggleMacro() })
+            }
+            if (mode == Mode.PHOTO && hdrExtAvailable) {
+                items.add(QItem("HDR", "自动 HDR", prefs.autoHdr) { prefs.autoHdr = !prefs.autoHdr; rebind() })
+            }
+            items.add(QItem(if (timerSec == 0) "关" else "${timerSec}s", "倒数计时", timerSec > 0) {
+                timerSec = when (timerSec) { 0 -> 3; 3 -> 10; else -> 0 }; buildQuickPanel(); buildTopBar()
+            })
+            if (isPhotoLike()) {
+                items.add(QItem(if (intervalSec == 0) "关" else "${intervalSec}s", "间隔连拍", intervalSec > 0) {
+                    intervalSec = when (intervalSec) { 0 -> 2; 2 -> 5; 5 -> 10; else -> 0 }; buildQuickPanel(); buildTopBar()
+                    if (intervalSec > 0) toast("间隔连拍：按快门开始，每 ${intervalSec} 秒拍一张，再按一次停止")
+                })
+            }
+        }
+        items.add(QItem("#", "网格", prefs.grid) { prefs.grid = !prefs.grid; overlay.grid = prefs.grid; buildQuickPanel() })
+        items.add(QItem("⚙", "设置", false) { hideQuickPanel(); showSettings() })
+        fillGrid(items)
+    }
+
+    private fun buildMorePanel() {
+        val pinned = pinnedModes()
+        val items = Mode.values().filter { modeAvailable(it) && it !in pinned }.map { m ->
+            QItem(m.icon, m.label, m == mode) { hideQuickPanel(); setMode(m) }
+        }
+        fillGrid(items, "编辑 ✎" to { editPinnedModes() })
+        if (items.isEmpty()) quickPanel.addView(TextView(this).apply {
+            text = "所有模式都已放在下方主列"; setTextColor(Color.GRAY); textSize = 13f; gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, dp(12))
+        })
+    }
+
+    private fun editPinnedModes() {
+        val all = Mode.values().filter { modeAvailable(it) }
+        val pinned = pinnedModes().toMutableSet()
+        val checked = BooleanArray(all.size) { all[it] in pinned }
+        AlertDialog.Builder(this, R.style.Dialog_AutoCamera)
+            .setTitle("选择放在主列的模式")
+            .setMultiChoiceItems(all.map { it.label }.toTypedArray(), checked) { _, i, c -> checked[i] = c }
+            .setPositiveButton("完成") { _, _ ->
+                val sel = all.filterIndexed { i, _ -> checked[i] }.ifEmpty { listOf(Mode.PHOTO) }
+                prefs.pinnedModes = sel.joinToString(",") { it.name }
+                buildModeBar(); if (quickPanel.visibility == View.VISIBLE) buildMorePanel()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun toggleMacro() {
+        macroOn = !macroOn
+        if (macroOn) {
+            sportOn = false
+            val r = report
+            val tele = r?.stops?.firstOrNull { it.type == "tele" && it.available }
+            val uw = r?.stops?.firstOrNull { it.type == "uw" && it.available }
+            val pick = when { r?.macro == "tele" && tele != null -> tele; uw != null && r?.macro != null -> uw; else -> null }
+            if (pick != null && facing == CameraSelector.LENS_FACING_BACK) {
+                onZoomStop(pick)
+                toast(if (pick.type == "tele") "微距：已切到 ${fmtZ(pick.z)}× 长焦，离主体约 10–30 cm" else "微距：已切到超广角，靠近到 3–5 cm")
+            } else {
+                toast("微距：慢慢靠近主体，直到画面清晰")
+            }
+        }
+        if (prefs.autoHdr && hdrExtAvailable && mode == Mode.PHOTO) rebind() else { applyPro(); buildTopBar(); buildQuickPanel() }
+    }
+
+    private val intervalTick = object : Runnable {
+        override fun run() {
+            if (!intervalRunning) return
+            takePhoto(false)
+            intervalShots++
+            recTime.text = "间隔连拍 · 已拍 $intervalShots 张"
+            main.postDelayed(this, intervalSec * 1000L)
+        }
+    }
+
+    private fun startInterval() {
+        intervalRunning = true
+        intervalShots = 0
+        recTime.visibility = View.VISIBLE
+        recTime.text = "间隔连拍 · 准备中"
+        updateShutterIcon()
+        setChromeEnabled(false)
+        main.post(intervalTick)
+    }
+
+    private fun stopInterval() {
+        if (!intervalRunning) return
+        intervalRunning = false
+        main.removeCallbacks(intervalTick)
+        recTime.visibility = View.GONE
+        updateShutterIcon()
+        setChromeEnabled(true)
+        toast("间隔连拍结束，共 $intervalShots 张")
+    }
+
     // ---------------------------------------------------------------- 快门
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupShutter() {
         shutter.setOnClickListener { onShutter() }
         shutter.setOnLongClickListener {
-            if ((mode == Mode.PHOTO || mode == Mode.PRO) && timerSec == 0 && !counting) {
+            if (isPhotoLike() && timerSec == 0 && intervalSec == 0 && !counting) {
                 bursting = true; burstCount = 0
                 takePhoto(burst = true)
                 true
@@ -906,8 +1168,9 @@ class MainActivity : AppCompatActivity() {
     private fun updateShutterIcon() {
         shutter.setBackgroundResource(
             when {
-                mode == Mode.VIDEO && recording != null -> R.drawable.shutter_stop
-                mode == Mode.VIDEO -> R.drawable.shutter_video
+                isVideo() && recording != null -> R.drawable.shutter_stop
+                isVideo() -> R.drawable.shutter_video
+                intervalRunning -> R.drawable.shutter_stop
                 else -> R.drawable.shutter_photo
             }
         )
@@ -915,9 +1178,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun onShutter() {
         if (counting) { cancelCountdown(); return }
-        if (mode == Mode.VIDEO) {
+        if (intervalRunning) { stopInterval(); return }
+        if (isVideo()) {
             if (recording != null) { recording?.stop(); return }
             withTimer { startRecording() }
+        } else if (intervalSec > 0) {
+            withTimer { startInterval() }
         } else {
             withTimer { takePhoto(false) }
         }

@@ -15,6 +15,8 @@ class Prefs(ctx: Context) {
     var videoStab: Boolean get() = b("videoStab", true); set(v) = setB("videoStab", v)
     var volumeShutter: Boolean get() = b("volShutter", true); set(v) = setB("volShutter", v)
     var shutterSound: Boolean get() = b("sound", true); set(v) = setB("sound", v)
+    var autoHdr: Boolean get() = b("autoHdr", true); set(v) = setB("autoHdr", v)
+    var pinnedModes: String get() = sp.getString("pinned", "PHOTO,PORTRAIT,VIDEO,PRO")!!; set(v) = sp.edit().putString("pinned", v).apply()
     var grid: Boolean get() = b("grid", false); set(v) = setB("grid", v)
     var ratio: Int get() = sp.getInt("ratio", 0); set(v) = sp.edit().putInt("ratio", v).apply()
     var folder: String get() = sp.getString("folder", "DCIM/AutoCamera")!!; set(v) = sp.edit().putString("folder", v).apply()
