@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
@@ -49,6 +50,7 @@ import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.DynamicRange
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -93,10 +95,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var overlay: OverlayView
     private lateinit var flashView: View
     private lateinit var topBar: LinearLayout
-    private lateinit var btnFlash: TextView
-    private lateinit var btnTimer: TextView
-    private lateinit var btnRatio: TextView
-    private lateinit var btnGrid: TextView
+    private lateinit var optionScroll: View
+    private lateinit var optionStrip: LinearLayout
     private lateinit var recTime: TextView
     private lateinit var countdown: TextView
     private lateinit var proInfo: TextView
@@ -133,7 +133,15 @@ class MainActivity : AppCompatActivity() {
     private var burstCount = 0
     private var defaultZoomMin = 1f
     private var defaultZoomMax = 1f
-    private var fps60Fallback = false
+    private var torchOn = false
+
+    // 这支手机实际支持的录像／拍照规格（每次绑定前从相机读取）
+    private var videoQualityList: List<Quality> = listOf(Quality.FHD)
+    private var fpsList: List<Int> = listOf(30)
+    private var hdrSupported = false
+    private var stabSupported = false
+    private var photoStdMp = 12
+    private var photoMaxMp = 12
 
     // 实时拍摄参数（专业模式显示，第二阶段测距也会用到）
     @Volatile private var liveIso: Int? = null
@@ -173,7 +181,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         overlay.grid = prefs.grid
-        setupTopBar()
         setupGestures()
         setupShutter()
         btnSwitch.setOnClickListener { switchFacing() }
@@ -228,10 +235,8 @@ class MainActivity : AppCompatActivity() {
         overlay = findViewById(R.id.overlay)
         flashView = findViewById(R.id.flashView)
         topBar = findViewById(R.id.topBar)
-        btnFlash = findViewById(R.id.btnFlash)
-        btnTimer = findViewById(R.id.btnTimer)
-        btnRatio = findViewById(R.id.btnRatio)
-        btnGrid = findViewById(R.id.btnGrid)
+        optionScroll = findViewById(R.id.optionScroll)
+        optionStrip = findViewById(R.id.optionStrip)
         recTime = findViewById(R.id.recTime)
         countdown = findViewById(R.id.countdown)
         proInfo = findViewById(R.id.proInfo)
@@ -307,7 +312,7 @@ class MainActivity : AppCompatActivity() {
         val w = root.width
         if (w == 0) { root.post { rebind() }; return }
         val lp = frame.layoutParams as FrameLayout.LayoutParams
-        when (prefs.ratio) {
+        when (if (mode == Mode.VIDEO) 1 else prefs.ratio) {
             0 -> { lp.width = w; lp.height = w * 4 / 3 }
             1 -> { lp.width = w; lp.height = w * 16 / 9 }
             2 -> { lp.width = w; lp.height = w }
@@ -315,7 +320,6 @@ class MainActivity : AppCompatActivity() {
         }
         lp.gravity = Gravity.CENTER
         frame.layoutParams = lp
-        btnRatio.text = arrayOf("4:3", "16:9", "1:1", "全屏")[prefs.ratio]
         frame.post { bindUseCases() }
     }
 
@@ -336,7 +340,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val aspect = if (prefs.ratio == 1 || prefs.ratio == 3) androidx.camera.core.AspectRatio.RATIO_16_9 else androidx.camera.core.AspectRatio.RATIO_4_3
+        val aspect = if (mode == Mode.VIDEO || prefs.ratio == 1 || prefs.ratio == 3) androidx.camera.core.AspectRatio.RATIO_16_9 else androidx.camera.core.AspectRatio.RATIO_4_3
         val aspectStrategy = AspectRatioStrategy(aspect, AspectRatioStrategy.FALLBACK_RULE_AUTO)
 
         val previewBuilder = Preview.Builder()
@@ -350,23 +354,35 @@ class MainActivity : AppCompatActivity() {
         })
         val preview = previewBuilder.build()
 
+        val preInfo = try { selector.filter(p.availableCameraInfos).firstOrNull() } catch (e: Exception) { null }
+        if (preInfo != null) readCapabilities(preInfo)
+
         val viewPort = previewView.viewPort
         val group = UseCaseGroup.Builder().addUseCase(preview)
         if (viewPort != null) group.setViewPort(viewPort)
 
         if (mode == Mode.VIDEO) {
-            val q = if (prefs.video4k) Quality.UHD else Quality.FHD
+            val q = currentQuality()
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
                 .build()
             val vb = VideoCapture.Builder(recorder).setTargetRotation(rotation)
-            if (prefs.fps60 && !fps60Fallback) vb.setTargetFrameRate(Range(60, 60))
+            val fps = currentFps()
+            vb.setTargetFrameRate(Range(fps, fps))
+            if (prefs.videoHdr && hdrSupported) vb.setDynamicRange(DynamicRange.HLG_10_BIT)
+            if (prefs.videoStab && stabSupported) vb.setVideoStabilizationEnabled(true)
             val vc = vb.build()
             videoCapture = vc
             group.addUseCase(vc)
         } else {
             val resBuilder = ResolutionSelector.Builder().setAspectRatioStrategy(aspectStrategy)
-            if (prefs.maxResolution) resBuilder.setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+            if (prefs.maxResolution && photoMaxMp > photoStdMp) {
+                resBuilder.setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                if (ext == null) resBuilder.setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+            } else {
+                val target = if (aspect == androidx.camera.core.AspectRatio.RATIO_16_9) Size(4000, 2250) else Size(4000, 3000)
+                resBuilder.setResolutionStrategy(ResolutionStrategy(target, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+            }
             val ic = ImageCapture.Builder()
                 .setCaptureMode(if (prefs.maxQuality) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                 .setResolutionSelector(resBuilder.build())
@@ -379,10 +395,16 @@ class MainActivity : AppCompatActivity() {
         try {
             camera = p.bindToLifecycle(this, selector, group.build())
         } catch (e: Exception) {
-            if (mode == Mode.VIDEO && prefs.fps60 && !fps60Fallback) {
-                fps60Fallback = true
-                toast("这支手机不支持 60 fps，已改为 30 fps")
-                bindUseCases(); return
+            if (mode == Mode.VIDEO) {
+                when {
+                    prefs.videoHdr && hdrSupported -> { prefs.videoHdr = false; toast("目前的规格不支持 HDR，已关闭 HDR"); bindUseCases(); return }
+                    currentFps() > 30 -> { prefs.videoFps = 30; toast("目前的分辨率不支持这个帧率，已改为 30fps"); bindUseCases(); return }
+                    currentQuality() == Quality.UHD -> { prefs.videoQuality = "FHD"; toast("无法使用 4K，已改为 1080P"); bindUseCases(); return }
+                    prefs.videoStab && stabSupported -> { prefs.videoStab = false; toast("已关闭防抖"); bindUseCases(); return }
+                }
+            }
+            if (mode != Mode.VIDEO && prefs.maxResolution) {
+                prefs.maxResolution = false; toast("无法使用最高像素，已改为标准像素"); bindUseCases(); return
             }
             if (boundCameraId != null) {
                 boundCameraId = null; pendingZoom = 1f
@@ -404,8 +426,8 @@ class MainActivity : AppCompatActivity() {
             cam.cameraControl.setZoomRatio(pendingZoom)
             pendingZoom = 1f
         }
-        btnFlash.visibility = if (cam.cameraInfo.hasFlashUnit()) View.VISIBLE else View.GONE
-        applyFlash()
+        if (mode == Mode.VIDEO) cam.cameraControl.enableTorch(torchOn) else applyFlash()
+        buildTopBar()
         buildZoomRow()
         setupExposure()
         buildProPanel()
@@ -415,33 +437,131 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------------------------------------------------------- 顶部按钮
 
-    private fun setupTopBar() {
-        btnFlash.setOnClickListener {
-            flash = (flash + 1) % 4
-            applyFlash()
+    private fun readCapabilities(info: androidx.camera.core.CameraInfo) {
+        try {
+            val caps = Recorder.getVideoCapabilities(info)
+            hdrSupported = caps.supportedDynamicRanges.contains(DynamicRange.HLG_10_BIT)
+            stabSupported = caps.isStabilizationSupported
+            val dr = if (prefs.videoHdr && hdrSupported) DynamicRange.HLG_10_BIT else DynamicRange.SDR
+            val sup = caps.getSupportedQualities(dr)
+            videoQualityList = listOf(Quality.HD, Quality.FHD, Quality.UHD).filter { it in sup }.ifEmpty { listOf(Quality.FHD) }
+        } catch (e: Exception) {
+            hdrSupported = false; stabSupported = false
+            videoQualityList = listOf(Quality.HD, Quality.FHD)
         }
-        btnTimer.setOnClickListener {
-            timerSec = when (timerSec) { 0 -> 3; 3 -> 10; else -> 0 }
-            btnTimer.text = if (timerSec == 0) "定时 关" else "定时 ${timerSec}s"
-            btnTimer.setTextColor(if (timerSec == 0) Color.WHITE else Color.rgb(255, 182, 39))
-        }
-        btnRatio.setOnClickListener {
-            if (recording != null) return@setOnClickListener
-            prefs.ratio = (prefs.ratio + 1) % 4
-            rebind()
-        }
-        btnGrid.setOnClickListener {
-            prefs.grid = !prefs.grid
-            overlay.grid = prefs.grid
-            btnGrid.setTextColor(if (prefs.grid) Color.rgb(255, 182, 39) else Color.WHITE)
-        }
-        btnGrid.setTextColor(if (prefs.grid) Color.rgb(255, 182, 39) else Color.WHITE)
-        findViewById<TextView>(R.id.btnSettings).setOnClickListener { showSettings() }
+        fpsList = try {
+            info.supportedFrameRateRanges.filter { it.lower == it.upper && it.upper in 24..60 }.map { it.upper }.distinct().sorted()
+        } catch (e: Exception) { emptyList() }.ifEmpty { listOf(30) }
+        try {
+            val c2 = Camera2CameraInfo.from(info)
+            val map = c2.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            if (map != null) {
+                val sizes = (map.getOutputSizes(ImageFormat.JPEG)?.toList() ?: emptyList()) +
+                    (map.getHighResolutionOutputSizes(ImageFormat.JPEG)?.toList() ?: emptyList())
+                val want = if (prefs.ratio == 1 || prefs.ratio == 3) 16f / 9f else 4f / 3f
+                val match = sizes.filter { abs(max(it.width, it.height).toFloat() / min(it.width, it.height) - want) < 0.05f }
+                val mps = match.map { (it.width.toLong() * it.height / 1_000_000L).toInt() }
+                if (mps.isNotEmpty()) {
+                    photoMaxMp = mps.max()
+                    photoStdMp = mps.filter { it <= 13 }.maxOrNull() ?: mps.min()
+                }
+            }
+        } catch (_: Exception) { }
     }
 
+    private fun qualityName(q: Quality) = when (q) { Quality.UHD -> "4K"; Quality.FHD -> "1080P"; Quality.HD -> "720P"; else -> "480P" }
+    private fun qualityKey(q: Quality) = when (q) { Quality.UHD -> "UHD"; Quality.FHD -> "FHD"; Quality.HD -> "HD"; else -> "SD" }
+
+    private fun currentQuality(): Quality {
+        val want = when (prefs.videoQuality) { "UHD" -> Quality.UHD; "HD" -> Quality.HD; else -> Quality.FHD }
+        return if (want in videoQualityList) want else (videoQualityList.lastOrNull { it != Quality.UHD } ?: videoQualityList.last())
+    }
+
+    private fun currentFps(): Int {
+        val f = prefs.videoFps
+        return if (f in fpsList) f else (fpsList.filter { it <= 30 }.maxOrNull() ?: fpsList.first())
+    }
+
+    private class TopItem(val label: String, val active: Boolean, val onClick: () -> Unit)
+
+    /** 取景画面顶部的快捷列，跟系统相机一样：拍照、录像显示不同的选项。 */
+    private fun buildTopBar() {
+        hideOptions()
+        topBar.removeAllViews()
+        val items = mutableListOf<TopItem>()
+        val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
+        if (mode == Mode.VIDEO) {
+            if (hasFlash) items.add(TopItem(if (torchOn) "补光 开" else "补光 关", torchOn) {
+                torchOn = !torchOn; camera?.cameraControl?.enableTorch(torchOn); buildTopBar()
+            })
+            val qs = videoQualityList
+            val cq = currentQuality()
+            items.add(TopItem(qualityName(cq), true) {
+                showOptions(qs.map { qualityName(it) }, qs.indexOf(cq)) { i ->
+                    prefs.videoQuality = qualityKey(qs[i]); rebind()
+                }
+            })
+            val cf = currentFps()
+            items.add(TopItem("${cf}fps", true) {
+                showOptions(fpsList.map { "$it fps" }, fpsList.indexOf(cf)) { i -> prefs.videoFps = fpsList[i]; rebind() }
+            })
+            if (hdrSupported) items.add(TopItem("HDR", prefs.videoHdr) { prefs.videoHdr = !prefs.videoHdr; rebind() })
+            if (stabSupported) items.add(TopItem("防抖", prefs.videoStab) { prefs.videoStab = !prefs.videoStab; rebind() })
+        } else {
+            if (hasFlash) items.add(TopItem(arrayOf("自动闪光", "闪光 开", "闪光 关", "常亮")[flash], flash != 2) {
+                flash = (flash + 1) % 4; applyFlash(); buildTopBar()
+            })
+            items.add(TopItem(if (timerSec == 0) "定时 关" else "定时 ${timerSec}s", timerSec != 0) {
+                timerSec = when (timerSec) { 0 -> 3; 3 -> 10; else -> 0 }; buildTopBar()
+            })
+            val ratios = listOf("4:3", "16:9", "1:1", "全屏")
+            items.add(TopItem(ratios[prefs.ratio], false) {
+                showOptions(ratios, prefs.ratio) { i -> prefs.ratio = i; rebind() }
+            })
+            val actual = imageCapture?.resolutionInfo?.resolution?.let { (it.width.toLong() * it.height / 1_000_000L).toInt() }
+            if (photoMaxMp > photoStdMp + 1) {
+                val label = "${actual ?: if (prefs.maxResolution) photoMaxMp else photoStdMp}M"
+                items.add(TopItem(label, prefs.maxResolution) {
+                    showOptions(listOf("标准 ${photoStdMp}M", "最高 ${photoMaxMp}M"), if (prefs.maxResolution) 1 else 0) { i ->
+                        prefs.maxResolution = i == 1; rebind()
+                    }
+                })
+            }
+        }
+        items.add(TopItem("网格", prefs.grid) { prefs.grid = !prefs.grid; overlay.grid = prefs.grid; buildTopBar() })
+        items.add(TopItem("设置", false) { showSettings() })
+        for (it in items) {
+            topBar.addView(TextView(this).apply {
+                text = it.label
+                textSize = 13f
+                gravity = Gravity.CENTER
+                setTextColor(if (it.active) Color.rgb(255, 182, 39) else Color.WHITE)
+                setOnClickListener { _ -> if (recording == null || it.label.startsWith("补光")) it.onClick() }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+        }
+    }
+
+    /** 点顶部按钮后展开的一排选项，例如 720P / 1080P / 4K。 */
+    private fun showOptions(options: List<String>, selected: Int, onPick: (Int) -> Unit) {
+        if (optionScroll.visibility == View.VISIBLE) { hideOptions(); return }
+        optionStrip.removeAllViews()
+        options.forEachIndexed { i, label ->
+            optionStrip.addView(TextView(this).apply {
+                text = label
+                textSize = 14f
+                gravity = Gravity.CENTER
+                setPadding(dp(16), 0, dp(16), 0)
+                setTextColor(if (i == selected) Color.rgb(255, 182, 39) else Color.WHITE)
+                paint.isFakeBoldText = i == selected
+                setOnClickListener { hideOptions(); if (i != selected) onPick(i) }
+            }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT))
+        }
+        optionScroll.visibility = View.VISIBLE
+    }
+
+    private fun hideOptions() { optionScroll.visibility = View.GONE }
+
     private fun applyFlash() {
-        btnFlash.text = arrayOf("闪光 自动", "闪光 开", "闪光 关", "常亮")[flash]
-        btnFlash.setTextColor(if (flash == 2) Color.WHITE else Color.rgb(255, 182, 39))
         val cam = camera ?: return
         if (!cam.cameraInfo.hasFlashUnit()) return
         cam.cameraControl.enableTorch(flash == 3)
@@ -590,7 +710,10 @@ class MainActivity : AppCompatActivity() {
             }
         })
         val tap = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onSingleTapUp(e: MotionEvent): Boolean { focusAt(e.x, e.y); return true }
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                if (optionScroll.visibility == View.VISIBLE) { hideOptions(); return true }
+                focusAt(e.x, e.y); return true
+            }
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 val cam = camera ?: return false
                 cam.cameraControl.cancelFocusAndMetering()
@@ -903,7 +1026,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun setChromeEnabled(on: Boolean) {
         val a = if (on) 1f else 0.3f
-        modeBar.alpha = a; btnSwitch.alpha = a; btnRatio.alpha = a; thumb.alpha = a
+        modeBar.alpha = a; btnSwitch.alpha = a; thumb.alpha = a
     }
 
     // ---------------------------------------------------------------- 缩略图
@@ -946,10 +1069,10 @@ class MainActivity : AppCompatActivity() {
         var needRebind = false
         header("照片")
         sw("最高画质（拍照稍慢）", prefs.maxQuality) { prefs.maxQuality = it; needRebind = true }
-        sw("最高分辨率", prefs.maxResolution) { prefs.maxResolution = it; needRebind = true }
-        header("录像")
-        sw("4K 分辨率（关闭为 1080p）", prefs.video4k) { prefs.video4k = it; needRebind = true }
-        sw("60 fps（关闭为 30 fps）", prefs.fps60) { prefs.fps60 = it; fps60Fallback = false; needRebind = true }
+        box.addView(TextView(this).apply {
+            text = "像素、录像分辨率、帧率、HDR、防抖都在取景画面顶部，点一下就能选。"
+            textSize = 12f; setTextColor(Color.GRAY); setPadding(0, dp(4), 0, 0)
+        })
         header("操作")
         sw("音量键拍照", prefs.volumeShutter) { prefs.volumeShutter = it }
         sw("快门声音", prefs.shutterSound) { prefs.shutterSound = it }

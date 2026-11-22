@@ -38,12 +38,26 @@
         android:gravity="center_vertical"
         android:orientation="horizontal">
 
-        <TextView android:id="@+id/btnFlash" style="@style/TopBtn" android:text="闪光 自动" />
-        <TextView android:id="@+id/btnTimer" style="@style/TopBtn" android:text="定时 关" />
-        <TextView android:id="@+id/btnRatio" style="@style/TopBtn" android:text="4:3" />
-        <TextView android:id="@+id/btnGrid" style="@style/TopBtn" android:text="网格" />
-        <TextView android:id="@+id/btnSettings" style="@style/TopBtn" android:text="设置" />
     </LinearLayout>
+
+    <HorizontalScrollView
+        android:id="@+id/optionScroll"
+        android:layout_width="match_parent"
+        android:layout_height="44dp"
+        android:layout_gravity="top"
+        android:layout_marginTop="48dp"
+        android:background="#CC000000"
+        android:scrollbars="none"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/optionStrip"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="8dp" />
+    </HorizontalScrollView>
 
     <TextView
         android:id="@+id/recTime"
