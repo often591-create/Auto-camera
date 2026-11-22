@@ -38,6 +38,7 @@ jobs:
         run: |
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release.apk dist/AutoCamera-${{ github.run_number }}.apk
+          cp helper/build/outputs/apk/release/helper-release.apk dist/AutoCamera-Helper-${{ github.run_number }}.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -50,5 +51,8 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}
           name: Auto Camera build ${{ github.run_number }}
-          body: 自动编译的 Android 安装文件。下载 APK 后在手机上打开安装（需要允许「安装未知来源应用」）。
+          body: |
+            AutoCamera-xx.apk：相机 App
+            AutoCamera-Helper-xx.apk：配合系统相机的助手（悬浮窗、滤镜、水印）
+            下载后在手机上打开安装（需要允许「安装未知来源应用」）。
           files: dist/*.apk

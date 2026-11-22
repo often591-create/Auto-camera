@@ -13,4 +13,4 @@ dependencyResolutionManagement {
     }
 }
 rootProject.name = "AutoCamera"
-include(":app")
+include(":app", ":helper")

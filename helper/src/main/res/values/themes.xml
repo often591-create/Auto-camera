@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.Helper" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorAccent">#FFB627</item>
+        <item name="colorPrimary">#FFB627</item>
+    </style>
+</resources>
