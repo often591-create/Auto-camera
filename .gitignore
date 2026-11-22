@@ -1,4 +1,6 @@
-node_modules/
-android/
-www/vendor/
+.gradle/
+build/
+local.properties
+*.keystore
 *.apk
+.idea/

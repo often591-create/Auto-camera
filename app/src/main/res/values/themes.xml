@@ -1,0 +1,21 @@
+<resources>
+    <style name="Theme.AutoCamera" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/black</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+        <item name="colorAccent">#FFB627</item>
+        <item name="colorPrimary">#FFB627</item>
+    </style>
+    <style name="TopBtn">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">match_parent</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:gravity">center</item>
+        <item name="android:textColor">#FFFFFF</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:background">?android:attr/selectableItemBackground</item>
+    </style>
+    <style name="Dialog.AutoCamera" parent="Theme.AppCompat.Dialog.Alert">
+        <item name="colorAccent">#FFB627</item>
+    </style>
+</resources>
